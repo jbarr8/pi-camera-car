@@ -1,104 +1,334 @@
+from gevent import monkey
+monkey.patch_all(thread=False, threading=False)
+
 import cv2
-import time
 import RPi.GPIO as GPIO
 from picamera2 import Picamera2
-from flask import Response
-from flask import Flask
-from flask_socketio import SocketIO, emit
-from flask import render_template
+from flask import Flask, send_file, request
+from flask_socketio import SocketIO, emit, ConnectionRefusedError
+from flask import render_template, request
+import base64
+import ctypes
+import random
+import string
+import os
+import setproctitle
+
+DEBUG = True
+
+# Frame rate of video stream
+FRAME_RATE = 20
+
+# Values below this do not provide enough power to move the car
+# so anytime the throttle is activated, do not allow it to drop below this.
+MIN_THROTTLE_VALUE = 45
+
+# Anytime the throttle is activated, do not allow it to go above this.
+MAX_THROTTLE_VALUE = 60
+
+# A higher value results in more force being required to drive
+DRIVE_SENSITIVITY = 360
+
+# A higher value results in more force being required to steer
+STEER_SENSITIVITY = 360
+
+# Minimum allowed steer angle - any joystick value below this will be floored to this value
+MIN_STEER_ANGLE = 60  # 0 to 180
+
+# Maximum allowed steer angle - any joystick value above this will be ceilinged to this value
+MAX_STEER_ANGLE = 120  # 0 to 180
+
+# Round the steer value to the nearest
+STEER_VALUE_GRANULARITY = 10
+
+# Force the camera to center horizontally when driving
+CENTER_CAMERA_PAN_WHEN_DRIVING = True
+
+# Force the camera to center vertically when driving
+CENTER_CAMERA_TILT_WHEN_DRIVING = False
+
+# The password to authenticate
+# Set to False to disable auth
+PASSWORD = False
 
 app = Flask(__name__, static_folder="../frontend/dist/assets", template_folder="../frontend/dist")
 
-# Define cokoino 4wd robot hat control pins
-NSLEEP1 = 12  # The 1# drv8833 NSLEEP pin is connected to the GPO12 pin
-AN11 = 17     # The 1# drv8833 AN1 pin is connected to the GPO17 pin
-AN12 = 27     # The 1# drv8833 AN2 pin is connected to the GPO27 pin
-BN11 = 22     # The 1# drv8833 BN1 pin is connected to the GPO22 pin
-BN12 = 23     # The 1# drv8833 BN2 pin is connected to the GPO23 pin
-NSLEEP2 = 13  # The 2# drv8833 NSLEEP pin is connected to the GPO13 pin
-AN21 = 24     # The 2# drv8833 AN1 pin is connected to the GPO24 pin
-AN22 = 25     # The 2# drv8833 AN2 pin is connected to the GPO25 pin
-BN21 = 26     # The 2# drv8833 BN1 pin is connected to the GPO26 pin
-BN22 = 16     # The 2# drv8833 BN2 pin is connected to the GPO16 pin
+NSLEEP1 = 12
+AN11 = 17
+AN12 = 27
+BN11 = 22
+BN12 = 23
+NSLEEP2 = 13
+AN21 = 24
+AN22 = 25
+BN21 = 26
+BN22 = 16
 
-servo_pin = 21  # The servo is connected to the GPO21 pin
-temp1=1         # Assign the variable temp1 to 1
+servo_pin = 21
 
-# Set GPIO mode to BCM
-GPIO.setmode(GPIO.BCM)
-# Set pins to output mode
-GPIO.setup(NSLEEP1,GPIO.OUT)
-GPIO.setup(NSLEEP2,GPIO.OUT)
-GPIO.setup(AN11,GPIO.OUT)
-GPIO.setup(AN12,GPIO.OUT)
-GPIO.setup(BN21,GPIO.OUT)
-GPIO.setup(BN22,GPIO.OUT)
-GPIO.setup(servo_pin, GPIO.OUT)
-#Initialize DRV8833 signal
-GPIO.output(AN11,GPIO.LOW)
-GPIO.output(AN12,GPIO.LOW)
-GPIO.output(BN21,GPIO.LOW)
-GPIO.output(BN22,GPIO.LOW)
+socketio = SocketIO(app, async_mode='gevent')
 
-p1=GPIO.PWM(NSLEEP1,1000) #Initialize the PWM of NSLEEP1 pin and set the frequency to 1000Hz.
-p2=GPIO.PWM(NSLEEP2,1000) #Initialize the PWM of NSLEEP2 pin and set the frequency to 1000Hz.
-p1.start(30) #Start PWM with an initial duty cycle of 30
-p2.start(30) #Start PWM with an initial duty cycle of 30
+picam2 = None
+pwm = None
+p1 = None
+p2 = None
+camera_mount_controller = None
+worker = None
 
-# Create PWM object with frequency set to 50Hz
-pwm = GPIO.PWM(servo_pin, 50)
-# Start PWM with an initial duty cycle of 0%
-pwm.start(0)#Start PWM with an initial duty cycle of 30
+def cap_value(value, max_value):
+	if value > max_value:
+		value = max_value
+	elif value < -max_value:
+		value = -max_value
+	return value
 
-socketio = SocketIO(app)
+def round_to_nearest(number, nearest):
+	nearest_multiple = round(number / nearest) * nearest
+	return nearest_multiple
 
-picam2 = Picamera2()
-camera_config = picam2.create_video_configuration(main={"size": (320, 240), "format": "RGB888"})
-picam2.configure(camera_config)
-picam2.set_controls({"FrameRate": 20, "NoiseReductionMode": 1})
-picam2.start()
+def generate_random_string(length):
+	characters = string.ascii_letters + string.digits
+	random_string = ''.join(random.choices(characters, k=length))
+	return random_string
 
-def generate_frames():
-  while True:
-    frame = picam2.capture_array()
-    frame = cv2.flip(frame, 0)
-    _, buffer = cv2.imencode('.jpg', frame)
-    frame = buffer.tobytes()
-    yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+def get_files_sorted_by_creation_date(directory_path):
+	with os.scandir(directory_path) as entries:
+		files_with_ctime = [(entry.stat().st_ctime, entry) for entry in entries if entry.is_file()]
+	files_with_ctime.sort(reverse=True)
+	sorted_files = [f'/photo/{entry.name}' for timestamp, entry in files_with_ctime]
+	return sorted_files
 
-def set_angle(angle):
-	# Calculate duty cycle (0.5ms to 2.5ms=>0% -180%)
-	duty_cycle = angle / 18 + 2  # transcoding
-	pwm.ChangeDutyCycle(duty_cycle)  # Modify the duty cycle of the servo motor
+def get_album():
+	files_only = get_files_sorted_by_creation_date('./album')
+	return files_only
+
+def process_photo():
+	frame = picam2.capture_array()
+	frame = cv2.flip(frame, 0)
+	frame = cv2.flip(frame, 1)
+	image_file = f'./album/{generate_random_string(10)}.jpg'
+	cv2.imwrite(image_file, frame)
+
+	if DEBUG:
+		print(f'photo taken: {image_file}')
+
+def process_delete_photo(photo):
+	os.remove(f'./album/{os.path.basename(photo)}')
+
+def process_latency_problem():
+	# When there's a latency problem, stop all vehicle movement
+	print('latency problem')
+	GPIO.output(AN11,GPIO.LOW)
+	GPIO.output(AN12,GPIO.LOW)
+	GPIO.output(BN21,GPIO.LOW)
+	GPIO.output(BN22,GPIO.LOW)
+	pwm.ChangeDutyCycle(0)
 
 def process_command(data):
-	#set_angle(90)  # Set the servo to 90 degrees
-	if data['drive'] == 0:
-		time.sleep(0.5)  # Wait for 0.5 seconds
-		GPIO.output(AN11,GPIO.LOW) #Input low level to the AN1 pin of 1 # DRV8833
-		GPIO.output(AN12,GPIO.LOW) #Input low level to the AN2 pin of 1 # DRV8833
-		GPIO.output(BN21,GPIO.LOW) #Input low level to the BN1 pin of 2 # DRV8833
-		GPIO.output(BN22,GPIO.LOW) #Input low level to the BN2 pin of 2 # DRV8833
-	else:
-		time.sleep(0.5)  # Wait for 0.5 seconds
-		GPIO.output(AN11,GPIO.LOW)
-		GPIO.output(AN12,GPIO.HIGH)
-		GPIO.output(BN21,GPIO.LOW)
-		GPIO.output(BN22,GPIO.HIGH)
+	drive = None
+	steer_angle = None
+	device = data['device']
 	
+	if device == 'vehicle':
+		if data['drive'] == None:
+			GPIO.output(AN11,GPIO.LOW)
+			GPIO.output(AN12,GPIO.LOW)
+			GPIO.output(BN21,GPIO.LOW)
+			GPIO.output(BN22,GPIO.LOW)
+		else:
+			if CENTER_CAMERA_PAN_WHEN_DRIVING:
+				camera_mount_controller.reset_pan()
+			if CENTER_CAMERA_TILT_WHEN_DRIVING:
+				camera_mount_controller.reset_tilt()
+
+			# handle throttle
+			drive = cap_value(data['drive'], DRIVE_SENSITIVITY)
+			if drive > 0:
+				# forward
+				GPIO.output(AN11,GPIO.LOW)
+				GPIO.output(AN12,GPIO.HIGH)
+				GPIO.output(BN21,GPIO.LOW)
+				GPIO.output(BN22,GPIO.HIGH)
+			else:
+				# reverse
+				GPIO.output(AN11,GPIO.HIGH)
+				GPIO.output(AN12,GPIO.LOW)
+				GPIO.output(BN21,GPIO.HIGH)
+				GPIO.output(BN22,GPIO.LOW)
+
+			drive = round((abs(drive) / DRIVE_SENSITIVITY) * 90)
+			if drive < MIN_THROTTLE_VALUE:
+				# values below this cause the car to not move
+				drive = MIN_THROTTLE_VALUE
+			elif drive > MAX_THROTTLE_VALUE:
+				drive = MAX_THROTTLE_VALUE
+			p1.ChangeDutyCycle(drive)
+			p2.ChangeDutyCycle(drive)
+
+		if data['steer'] == None:
+			pwm.ChangeDutyCycle(0)
+		else:
+			steer = -cap_value(data['steer'], STEER_SENSITIVITY)
+			steer += STEER_SENSITIVITY
+			steer_angle = round(steer / (STEER_SENSITIVITY * 2) * 180)
+			steer_angle = round_to_nearest(steer_angle, STEER_VALUE_GRANULARITY)
+			if drive is None or drive <= 50:
+				if steer_angle < MIN_STEER_ANGLE:
+					steer_angle = MIN_STEER_ANGLE
+				elif steer_angle > MAX_STEER_ANGLE:
+					steer_angle = MAX_STEER_ANGLE
+			duty_cycle = steer_angle / 18 + 2
+			pwm.ChangeDutyCycle(duty_cycle)
+
+		if DEBUG:
+			print(f'drive: {drive}, steer_angle: {steer_angle}')
+	else:
+		if data['drive'] is not None:
+			if data['drive'] > 0:
+				camera_mount_controller.tilt_up()
+				if DEBUG:
+					print('tilt camera up')
+			else:
+				camera_mount_controller.tilt_down()
+				if DEBUG:
+					print('tilt camera down')
+		if data['steer'] is not None:
+			if data['steer'] > 0:
+				camera_mount_controller.pan_right()
+				if DEBUG:
+					print('pan camera right')
+			else:
+				camera_mount_controller.pan_left()
+				if DEBUG:
+					print('pan camera left')
+
+class StreamFramesWorker(object):
+	switch = False
+
+	def __init__(self, socketio):
+		self.socketio = socketio
+		self.switch = True
+
+	def stream_frames(self):
+		while True:
+			if self.switch:
+				frame = picam2.capture_array('lores')
+				frame = cv2.cvtColor(frame, cv2.COLOR_YUV420p2RGB)
+				frame = cv2.flip(frame, 0)
+				frame = cv2.flip(frame, 1)
+				ret, buffer = cv2.imencode('.jpg', frame)
+				if ret:
+					jpg_as_text = base64.b64encode(buffer).decode('utf-8')
+					socketio.emit('video_frame', {'image': jpg_as_text})
+			socketio.sleep(0.1)
+	
+	def stop(self):
+		print('stopping')
+		self.switch = False
+	
+	def start(self):
+		print('starting')
+		self.switch = True
+
 @app.route("/")
 def index():
-	return render_template("index.html")
+	require_auth = 'true' if PASSWORD else 'false'
+	return render_template("index.html", require_auth=require_auth)
 
-@app.route("/video_feed")
-def video_feed():
-	return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+@app.route('/photo/<filename>', methods=['GET'])
+def get_image(filename):
+	image_path = f'../album/{filename}'
+	return send_file(image_path, mimetype='image/jpeg')
+
+@app.route('/authenticate', methods=['POST'])
+def authenticate():
+	data = request.get_json()
+	if 'password' not in data or data['password'] != PASSWORD:
+		return { 'success': False }
+
+	return { 'success': True }
+
+@socketio.on('connect')
+def connect():
+	global picam2, pwm, p1, p2, camera_mount_controller
+
+	if PASSWORD and request.args.get('password') != PASSWORD:
+		raise ConnectionRefusedError('unauthorized!')
+	
+	if not picam2:
+		GPIO.setmode(GPIO.BCM)
+		GPIO.setup(NSLEEP1,GPIO.OUT)
+		GPIO.setup(NSLEEP2,GPIO.OUT)
+		GPIO.setup(AN11,GPIO.OUT)
+		GPIO.setup(AN12,GPIO.OUT)
+		GPIO.setup(BN21,GPIO.OUT)
+		GPIO.setup(BN22,GPIO.OUT)
+		GPIO.setup(servo_pin, GPIO.OUT)
+		GPIO.output(AN11,GPIO.LOW)
+		GPIO.output(AN12,GPIO.LOW)
+		GPIO.output(BN21,GPIO.LOW)
+		GPIO.output(BN22,GPIO.LOW)
+
+		p1=GPIO.PWM(NSLEEP1,1000)
+		p2=GPIO.PWM(NSLEEP2,1000)
+		p1.start(30)
+		p2.start(30)
+
+		pwm = GPIO.PWM(servo_pin, 50)
+		pwm.start(0)
+		
+		picam2 = Picamera2()
+		camera_config = picam2.create_video_configuration(
+			main={"size": (1440, 1080), "format": "RGB888"},
+			lores={"size": (256, 160), "format": "YUV420"},
+		)
+		picam2.configure(camera_config)
+		picam2.set_controls({"FrameRate": FRAME_RATE, "NoiseReductionMode": 1})
+		picam2.start()
+
+		# Pulled from https://github.com/ArduCAM/PCA9685/tree/master/example/rpi
+		# See Makefile for how to modify and recompile the C functions
+		camera_mount_lib_path = './backend/camera_mount/mount_functions.o'
+		camera_mount_controller = ctypes.CDLL(camera_mount_lib_path)
+
+		camera_mount_controller.init()
+
+	camera_mount_controller.reset_pan()
+	camera_mount_controller.reset_tilt()
+
+	global worker
+	worker = StreamFramesWorker(socketio)
+	socketio.start_background_task(target=worker.stream_frames)
+
+	emit('album', get_album())
 
 @socketio.on('command')
 def command(data):
-	#process_command(data)
-	print(data)
+	process_command(data)
 	emit('command_status', data)
 
+@socketio.on('latency_problem')
+def latency_problem():
+	process_latency_problem()
+
+@socketio.on('photo')
+def photo():
+	process_photo()
+	emit('album', get_album())
+
+@socketio.on('idle')
+def idle(data):
+	global worker
+	if data:
+		worker.stop()
+	else:
+		worker.start()
+
+@socketio.on('delete_photo')
+def delete_photo(photo):
+	process_delete_photo(photo)
+	emit('album', get_album())
+
 if __name__ == '__main__':
-	app.run(host='0.0.0.0', port=8000, debug=False, threaded=True, use_reloader=False)
+	setproctitle.setproctitle('pi-camera-car')
+	socketio.run(app, host='0.0.0.0', port=8000, debug=True)
