@@ -27,13 +27,14 @@ This is a Raspberry Pi car with a tiltable and pannable camera controlled by a p
 
 ## Features
 
-- Low latency using websockets for both video streaming (20 FPS) and controls (25 MS responsiveness)
+- Low latency for both video streaming (~20 FPS) and controls (~25 MS responsiveness)
 - Settings related to latency and video resolution can easily be configured
 - Intuitive controls with virtual joysticks that allow variability in speed and turning radius
 - Quickly toggle the UI between driving mode and camera platform position adjustment mode
 - The virtual joysticks that control the car movement also control the tilt and pan of the camera
 - Option to auto center the camera platform upon toggling back to driving mode
 - Take HD photos and save them to an album whose photos can be viewed with phone gesture zooming and panning
+- Detects if user is idle, and if so, stops streaming video until they re-engage (saves bandwidth)
 - The entire thing, including the Raspberry Pi, is powered by rechargable batteries
 - Can be controlled from anywhere in the world through the internet using ngrok (or locally on a WiFi network)
 
@@ -80,76 +81,45 @@ It's easiest to set the WiFi network name and password in the imaging software u
 
 3. Install (will reboot at the end)
 
-    `sudo make install`
+    `make install`
 
-#### Optional extra steps to setup for control through the internet
+#### Optional extra steps to setup internet control
+
+3. After the Pi comes back from rebooting, SSH back into it, and disable the car service
+
+    `systemctl stop car`
 
 4. [Sign up for an ngrok account](https://ngrok.com/)
 
 5. [Install and activate ngrok on the Raspberry Pi](https://ngrok.com/download/raspberry-pi)
 
-## How to run locally
+6. In the file `start_exec`, comment out the line `make start` and uncomment the line `make start-public`. Note that you can re-enable local WiFi mode by undoing this change.
 
-1. Start the flask application
+    ```
+    #!/bin/bash
+    #make start
+    make start-public
+    ```
 
-    `make start`
+7. Restart the car service
 
-2. On your phone, while on the same WiFi network as the Raspberry Pi, open a browser and navigate to the URL
+    `systemctl start car`
 
-    `http://<IP ADDRESS OF PI>:8000`
+## How to run
 
-## How to run through the internet
+When you turn the car on, and the Raspberry Pi boots up, the `car` service will start automatically.
 
-This requires that you did optional steps 4 and 5 from the software installation section.
+1. Turn on the car
 
-1. Start ngrok and the flask application
-
-    `make start-public`
-
-2. Get the publicly accessible URL
+2. Get the URL
 
     `make get-url`
 
 3. On your phone, open a browser and navigate to the URL displayed from step 2
 
-4. When you're done, run the stop command to close internet access and stop the flask application
+You should save the URL displayed from step 2 because it won't change unless your IP changes. After this, you will be able to simply turn on the car, wait about a minute, and then navigate to this URL on your phone.
 
-    `make stop`
-
-## Starting the car on boot
-
-Even though running the flask server is just a single command, it's inconvenient because it requires first SSH'ing into the Raspberry Pi (it's a pain to connect a mouse, keyboard, and monitor to a Raspberry Pi that's mounted on a robot car), which is why I recommend creating a service through systemctl to automatically start the flask server on boot. After these steps, every time you flip the switch to turn the car on, it will start up the flask server and be ready for you to control the car with your phone within a minute.
-
-1. Create the service file
-
-    `sudo nano /etc/systemd/system/car.service`
-
-    Add these contents to the file, replacing USER with your user. This example starts in local WiFi mode. If you want to start in public internet access mode, change `ExecStart` to reference the file `start_public_exec`.
-
-    ```
-    [Unit]
-    Description=Pi Camera Car
-    After=network.target
-
-    [Service]
-    WorkingDirectory=/home/USER/pi-camera-car
-    ExecStart=/home/USER/pi-camera-car/start_exec
-    Type=forking
-    User=USER
-
-    [Install]
-    WantedBy=multi-user.target
-    ```
-
-2. Restart the daemon
-
-    `sudo systemctl daemon-reload`
-
-3. Enable the service
-
-    `sudo systemctl enable car.service`
-
-## Protecting the controlling of the car with a password
+## Password protection
 
 Especially when opening up controls to the internet, you should set the `PASSWORD` in `backend/app.py` to prevent unauthorized access.
 

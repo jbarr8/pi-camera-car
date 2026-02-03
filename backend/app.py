@@ -13,6 +13,7 @@ import random
 import string
 import os
 import setproctitle
+from threading import Event
 
 DEBUG = True
 
@@ -21,25 +22,22 @@ FRAME_RATE = 20
 
 # Values below this do not provide enough power to move the car
 # so anytime the throttle is activated, do not allow it to drop below this.
-MIN_THROTTLE_VALUE = 45
+MIN_THROTTLE_VALUE = 40
 
 # Anytime the throttle is activated, do not allow it to go above this.
-MAX_THROTTLE_VALUE = 60
+MAX_THROTTLE_VALUE = 70
 
 # A higher value results in more force being required to drive
-DRIVE_SENSITIVITY = 360
+DRIVE_SENSITIVITY = 250
 
 # A higher value results in more force being required to steer
 STEER_SENSITIVITY = 360
 
 # Minimum allowed steer angle - any joystick value below this will be floored to this value
-MIN_STEER_ANGLE = 60  # 0 to 180
+MIN_STEER_ANGLE = 61  # 0 to 180
 
 # Maximum allowed steer angle - any joystick value above this will be ceilinged to this value
-MAX_STEER_ANGLE = 120  # 0 to 180
-
-# Round the steer value to the nearest
-STEER_VALUE_GRANULARITY = 10
+MAX_STEER_ANGLE = 110  # 0 to 180
 
 # Force the camera to center horizontally when driving
 CENTER_CAMERA_PAN_WHEN_DRIVING = True
@@ -75,16 +73,14 @@ p2 = None
 camera_mount_controller = None
 worker = None
 
+thread_event = Event()
+
 def cap_value(value, max_value):
 	if value > max_value:
 		value = max_value
 	elif value < -max_value:
 		value = -max_value
 	return value
-
-def round_to_nearest(number, nearest):
-	nearest_multiple = round(number / nearest) * nearest
-	return nearest_multiple
 
 def generate_random_string(length):
 	characters = string.ascii_letters + string.digits
@@ -171,12 +167,10 @@ def process_command(data):
 			steer = -cap_value(data['steer'], STEER_SENSITIVITY)
 			steer += STEER_SENSITIVITY
 			steer_angle = round(steer / (STEER_SENSITIVITY * 2) * 180)
-			steer_angle = round_to_nearest(steer_angle, STEER_VALUE_GRANULARITY)
-			if drive is None or drive <= 50:
-				if steer_angle < MIN_STEER_ANGLE:
-					steer_angle = MIN_STEER_ANGLE
-				elif steer_angle > MAX_STEER_ANGLE:
-					steer_angle = MAX_STEER_ANGLE
+			if steer_angle < MIN_STEER_ANGLE:
+				steer_angle = MIN_STEER_ANGLE
+			elif steer_angle > MAX_STEER_ANGLE:
+				steer_angle = MAX_STEER_ANGLE
 			duty_cycle = steer_angle / 18 + 2
 			pwm.ChangeDutyCycle(duty_cycle)
 
@@ -209,25 +203,26 @@ class StreamFramesWorker(object):
 		self.socketio = socketio
 		self.switch = True
 
-	def stream_frames(self):
-		while True:
-			if self.switch:
-				frame = picam2.capture_array('lores')
-				frame = cv2.cvtColor(frame, cv2.COLOR_YUV420p2RGB)
-				frame = cv2.flip(frame, 0)
-				frame = cv2.flip(frame, 1)
-				ret, buffer = cv2.imencode('.jpg', frame)
-				if ret:
-					jpg_as_text = base64.b64encode(buffer).decode('utf-8')
-					socketio.emit('video_frame', {'image': jpg_as_text})
-			socketio.sleep(0.1)
+	def stream_frames(self, event):
+		try:
+			while event.is_set():
+				if self.switch:
+					frame = picam2.capture_array('lores')
+					frame = cv2.cvtColor(frame, cv2.COLOR_YUV420p2RGB)
+					frame = cv2.flip(frame, 0)
+					frame = cv2.flip(frame, 1)
+					ret, buffer = cv2.imencode('.jpg', frame)
+					if ret:
+						jpg_as_text = base64.b64encode(buffer).decode('utf-8')
+						socketio.emit('video_frame', {'image': jpg_as_text})
+				socketio.sleep(0.1)
+		finally:
+			event.clear()
 	
 	def stop(self):
-		print('stopping')
 		self.switch = False
 	
 	def start(self):
-		print('starting')
 		self.switch = True
 
 @app.route("/")
@@ -298,9 +293,14 @@ def connect():
 
 	global worker
 	worker = StreamFramesWorker(socketio)
-	socketio.start_background_task(target=worker.stream_frames)
+	thread_event.set()
+	socketio.start_background_task(worker.stream_frames, thread_event)
 
 	emit('album', get_album())
+
+@socketio.on('disconnect')
+def on_disconnect():
+  thread_event.clear()
 
 @socketio.on('command')
 def command(data):

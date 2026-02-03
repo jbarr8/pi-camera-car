@@ -42,7 +42,10 @@ const CONTROLS_CAMERA_SYNC_INTERVAL_MS = 50;
 
 const CAMERA_ASPECT_RATIO = 4 / 3;
 
-const IDLE_TIME = 10000;
+// If controls aren't activated for this amount of time, the feed will go into an idle state
+// where new frames aren't sent. This saves on bandwidth.
+// Set to 0 to disable.
+const IDLE_TIME_MS = 10000;
 
 const getWindowDimensions = () => {
   const { innerWidth: width, innerHeight: height } = window;
@@ -137,14 +140,28 @@ function App() {
     });
   }, [authenticated]);
 
+  const handleResetIdle = () => {
+    if (IDLE_TIME_MS) {
+      setIdle(false);
+      if (idleTimer.current) {
+        clearTimeout(idleTimer.current);
+      }
+      idleTimer.current = setTimeout(() => {
+        setIdle(true);
+      }, [IDLE_TIME_MS]);
+    }
+  };
+
   useEffect(() => {
     if (commandTimer.current) {
       return;
     }
 
-    idleTimer.current = setTimeout(() => {
-      setIdle(true);
-    }, [IDLE_TIME]);
+    if (IDLE_TIME_MS) {
+      idleTimer.current = setTimeout(() => {
+        setIdle(true);
+      }, [IDLE_TIME_MS]);
+    }
 
     const optionsDrive = {
       zone: drive.current,
@@ -167,6 +184,7 @@ function App() {
     }).on('move', (evt, data) => {
       if (data.force && data.direction) {
 	      driveValue.current = convertNippleData(data);
+        handleResetIdle();
       }
     });
 
@@ -177,6 +195,7 @@ function App() {
     }).on('move', (evt, data) => {
       if (data.force && data.direction) {
 	      steerValue.current = convertNippleData(data);
+        handleResetIdle();
       }
     });
   }, []);
@@ -199,13 +218,6 @@ function App() {
             steer: steerValueCurated,
             device: device,
           });
-          setIdle(false);
-          if (idleTimer.current) {
-            clearTimeout(idleTimer.current);
-          }
-          idleTimer.current = setTimeout(() => {
-            setIdle(true);
-          }, [IDLE_TIME]);
         }
       }
     }, sync_interval);
@@ -319,16 +331,16 @@ function App() {
             _closed={{ animationName: "fade-out", animationDuration: "1500ms" }}
           >
             <div className="feedNotification">
-              <p>High latency. Controls are disabled. Please wait.</p>
+              <p>High latency detected. Controls are disabled. Please wait.</p>
             </div>
           </Presence>
           <Presence
             present={idle}
-            _open={{ animationName: "fade-in", animationDuration: "1000ms" }}
+            _open={{ animationName: "fade-in", animationDuration: "3000ms" }}
             _closed={{ animationName: "fade-out", animationDuration: "300ms" }}
           >
             <div className="feedNotification">
-              <p>You are currently idle. Touch the controls to re-activate.</p>
+              <p>You are currently idle. Touch the controls to begin.</p>
             </div>
           </Presence>
         </div>
