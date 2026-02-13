@@ -1,25 +1,25 @@
 from gevent import monkey
-monkey.patch_all(thread=False, threading=False)
+monkey.patch_all()
 from gpiozero import Motor
 
-import signal
-import sys
-import atexit
-import gpiozero as GPIO
+# for testing on Windows
+from gpiozero.pins.mock import MockFactory
+from gpiozero import Device
+Device.pin_factory = MockFactory()
+
 from flask import Flask, send_file, request
 from flask_socketio import SocketIO, emit, ConnectionRefusedError
 from flask import render_template, request
-import random
-import string
-from threading import Event
+
 
 app = Flask(__name__, static_folder="../frontend/dist/assets", template_folder="../frontend/dist")
+socketio = SocketIO(app, async_mode='gevent')
 
 # at some point, add PWM which allows for speed variation
 # https://gpiozero.readthedocs.io/en/stable/api_output.html#motor
 
-rearMotor = Motor(forward=18, backward=19)
-steeringMotor = Motor(forward=4, backward= 5)
+rearMotor = Motor(forward=18, backward=19, pwm=False)
+steeringMotor = Motor(forward=4, backward= 5, pwm=False)
 
 
 socketio = SocketIO(app, async_mode='gevent')
@@ -62,8 +62,6 @@ def process_command(data):
 				rearMotor.forward()
 
 
-
-
 @app.route("/")
 def index():
 	return render_template("index.html")
@@ -71,7 +69,6 @@ def index():
 
 @socketio.on('connect')
 def connect():
-	global pwm, p1, p2
 	steeringMotor.stop()
 	rearMotor.stop()
 
@@ -92,10 +89,11 @@ def idle(data):
 	global worker
 	if data:
 		worker.stop()
-
+		
 	else:
 		worker.start()
+		
 
 
 if __name__ == '__main__':
-	socketio.run(app, host='0.0.0.0', port=8000, debug=True)
+	socketio.run(app, host='0.0.0.0', port=8000)
