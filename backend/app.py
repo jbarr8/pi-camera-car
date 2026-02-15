@@ -7,9 +7,9 @@ from gpiozero.pins.mock import MockFactory
 from gpiozero import Device
 Device.pin_factory = MockFactory()
 
-from flask import Flask, send_file, request
-from flask_socketio import SocketIO, emit, ConnectionRefusedError
-from flask import render_template, request
+from flask import Flask
+from flask_socketio import SocketIO, emit
+from flask import render_template
 
 
 app = Flask(__name__, static_folder="../frontend/dist/assets", template_folder="../frontend/dist")
@@ -20,10 +20,7 @@ socketio = SocketIO(app, async_mode='gevent')
 
 rearMotor = Motor(forward=18, backward=19, pwm=False)
 steeringMotor = Motor(forward=4, backward= 5, pwm=False)
-
-
-socketio = SocketIO(app, async_mode='gevent')
-
+worker = None
 
 
 def process_latency_problem():
@@ -83,17 +80,6 @@ def latency_problem():
 	process_latency_problem()
 
 
-
-@socketio.on('idle')
-def idle(data):
-	global worker
-	if data:
-		worker.stop()
 		
-	else:
-		worker.start()
-		
-
-
 if __name__ == '__main__':
-	socketio.run(app, host='0.0.0.0', port=8000)
+	socketio.run(app, debug=True, host='0.0.0.0', port=8000)
